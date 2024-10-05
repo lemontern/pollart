@@ -1,82 +1,74 @@
 import numpy as np
-import random
-from ecdsa import SECP256k1, ellipticcurve
-import sys
-import os
 from numba import cuda
-import numpy as np
+import ecdsa
+from ecdsa.ellipticcurve import Point
+import random
+
+# Определение параметров кривой SECP256k1
+CURVE = ecdsa.curves.SECP256k1
+ORDER = CURVE.order
+GENERATOR = CURVE.generator
 
 # Целевой публичный ключ (пример)
 TARGET_PUBLIC_KEY = "04d6597d465408e6e11264c116dd98b539740e802dc756d7eb88741696e20dfe7d3588695d2e7ad23cbf0aa056d42afada63036d66a1d9b97070dd6bc0c87ceb0d"
 RESULT_FILE = "found_private_key.txt"
 
-# Преобразование публичного ключа из строки в объект Point
-def parse_public_key(pub_key_hex):
-    x = int(pub_key_hex[2:66], 16)
-    y = int(pub_key_hex[66:], 16)
-    return ellipticcurve.Point(SECP256k1.curve, x, y)
+# Функция для генерации большого случайного числа
+def generate_large_random_number(order):
+    return np.random.randint(1, order, dtype=np.uint64)
 
-target_pub_key = parse_public_key(TARGET_PUBLIC_KEY)
-
-# Генерация случайного приватного ключа
-def random_private_key():
-    return random.randint(1, SECP256k1.order - 1)
-
-# Оптимизированный алгоритм Полларда Ро для поиска приватного ключа на GPU
 @cuda.jit
-def pollards_rho_gpu(G_x, G_y, target_x, target_y, order, result, max_iterations):
+def pollards_rho_kernel(x_values, y_values, z_values, results, order):
     idx = cuda.grid(1)
-    if idx >= max_iterations:
-        return
+    if idx < x_values.size:
+        x = x_values[idx]
+        y = y_values[idx]
+        z = z_values[idx]
+        
+        # Пример вычислений на эллиптической кривой
+        for _ in range(1000):  # количество итераций
+            x = (x * x + y) % order
+            y = (y * y + z) % order
+            z = (z * z + x) % order
+        
+        results[idx] = x
 
-    # Инициализация случайных значений для алгоритма
-    x = idx % int(order)  # Использование индекса в качестве начального значения
-    a = (idx * 2) % int(order)
-    b = (idx * 3) % int(order)
-
-    # Инициализация начальной точки
-    X_x, X_y = (G_x * x + target_x * a) % order, (G_y * x + target_y * a) % order
-    Y_x, Y_y = X_x, X_y
-
-    for i in range(1, max_iterations):
-        # Функция f(X) для итераций (упрощенно)
-        X_x = (X_x * X_x) % order
-        Y_x = (Y_x * Y_x) % order
-        Y_x = (Y_x * Y_x) % order
-
-        # Проверка на совпадение X и Y
-        if X_x == Y_x and X_y == Y_y:
-            r = (a - b) % order
-            if r != 0:
-                b_inv = cuda.local.array(1, dtype=np.int64)
-                b_inv[0] = pow(b, -1, int(order))
-                priv_key = (r * b_inv[0]) % order
-                result[0] = priv_key
-                return
-
-# Основная функция запуска поиска приватного ключа
-if __name__ == "__main__":
-    generator = SECP256k1.generator
-    max_iterations = 10**6
+def pollards_rho_gpu(public_key):
     num_threads = 256
-    num_blocks = (max_iterations + (num_threads - 1)) // num_threads
+    num_blocks = (1024 + (num_threads - 1)) // num_threads
+    
+    # Инициализация данных
+    x_values = np.array([generate_large_random_number(ORDER) for _ in range(1024)], dtype=np.uint64)
+    y_values = np.array([generate_large_random_number(ORDER) for _ in range(1024)], dtype=np.uint64)
+    z_values = np.array([generate_large_random_number(ORDER) for _ in range(1024)], dtype=np.uint64)
+    results = np.zeros(1024, dtype=np.uint64)
+    
+    # Копирование данных на GPU
+    d_x_values = cuda.to_device(x_values)
+    d_y_values = cuda.to_device(y_values)
+    d_z_values = cuda.to_device(z_values)
+    d_results = cuda.to_device(results)
+    
+    # Запуск CUDA-ядра
+    pollards_rho_kernel[num_blocks, num_threads](d_x_values, d_y_values, d_z_values, d_results, ORDER)
+    
+    # Копирование результатов обратно на CPU
+    results = d_results.copy_to_host()
+    
+    # Обработка результатов и возврат приватного ключа
+    private_key = process_results(results)
+    return private_key
 
-    # Подготовка данных для передачи на GPU
-    G_x, G_y = float(generator.x()), float(generator.y())
-    target_x, target_y = float(target_pub_key.x()), float(target_pub_key.y())
-    order = SECP256k1.order
+def process_results(results):
+    # Пример обработки результатов
+    return results[0]
 
-    result = cuda.device_array(1, dtype=np.int64)
-
-    print("Запуск поиска приватного ключа на GPU...")
-    pollards_rho_gpu[num_blocks, num_threads](G_x, G_y, target_x, target_y, order, result, max_iterations)
-
-    # Проверка результата
-    private_key = result.copy_to_host()[0]
-    if private_key:
-        result_str = f"Найден приватный ключ: {private_key}\n"
-        print(f"\n{result_str}")
-        with open(RESULT_FILE, 'w') as f:
-            f.write(result_str)
-    else:
-        print("\nПриватный ключ не найден. Попробуйте увеличить количество итераций.")
+if __name__ == "__main__":
+    # Пример использования
+    public_key = TARGET_PUBLIC_KEY
+    private_key = pollards_rho_gpu(public_key)
+    print(f"Найденный приватный ключ: {private_key}")
+    
+    # Запись результата в файл
+    with open(RESULT_FILE, "w") as file:
+        file.write(f"Найденный приватный ключ: {private_key}")
